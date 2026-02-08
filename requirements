@@ -1,0 +1,11 @@
+python-telegram-bot==20.7
+pytesseract
+opencv-python-headles
+numpy
+Pillow
+openpyxl
+python-dotenv
+gspread
+google-auth
+pytz
+groq
