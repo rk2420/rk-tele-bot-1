@@ -1,11 +1,14 @@
 python-telegram-bot==20.7
+
 pytesseract
-opencv-python-headles
+opencv-python-headless
 numpy
 Pillow
-openpyxl
+
 python-dotenv
+pytz
+
 gspread
 google-auth
-pytz
+
 groq
