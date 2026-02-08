@@ -1,27 +1,27 @@
-FROM python:3.10-slim
+# ---------- Base Image ----------
+FROM python:3.11-slim
 
-# Install system dependencies
+# ---------- Environment ----------
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# ---------- System Dependencies ----------
 RUN apt-get update && apt-get install -y \
-    libgomp1 \
     tesseract-ocr \
+    libtesseract-dev \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# ---------- Working Directory ----------
 WORKDIR /app
 
-# Copy requirements first (better caching)
+# ---------- Python Dependencies ----------
 COPY requirements.txt .
-
-# Upgrade pip
-RUN pip install --upgrade pip
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# ---------- Application Code ----------
 COPY . .
 
-# Start the bot
-CMD ["python", "main.py"]
+# ---------- Start Bot ----------
+CMD ["python", "main1.py"]
