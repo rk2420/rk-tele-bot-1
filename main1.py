@@ -1,32 +1,29 @@
-# ===================== IMPORTS =====================
-import os
-import re
-import json
-import base64
-import pytz
-import requests
-from datetime import datetime
-
-from dotenv import load_dotenv
+from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from telegram import Update
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+import pytesseract
+from PIL import Image
+import cv2
+import numpy as np
+from openpyxl import load_workbook
+from datetime import datetime
+import json
+import re
+import logging
+from groq import Groq
 
-from paddleocr import PaddleOCR
-import gspread
-from google.oauth2.service_account import Credentials
-
-
-# ===================== LOAD ENV =====================
+# ================= CONFIG =================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+# =========================================
+# ===================== LOGGING =====================
+logging.basicConfig(level=logging.INFO)
+print("✅ Visiting Card Bot starting...")
 
 
 # ===================== RECREATE credentials.json =====================
@@ -45,7 +42,6 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1
 
-# Add header if empty
 if sheet.row_count == 0 or sheet.cell(1, 1).value is None:
     sheet.append_row([
         "Timestamp (IST)",
@@ -62,94 +58,182 @@ if sheet.row_count == 0 or sheet.cell(1, 1).value is None:
     ])
 
 
-# ===================== OCR (PaddleOCR - CPU ONLY) =====================
-ocr = PaddleOCR(
-    use_angle_cls=True,
-    lang="en",
-    use_gpu=False
-)
+# ---------- HELPERS ----------
+def safe(value):
+    return value if value and str(value).strip() else "Not Found"
 
-def run_ocr(image_path: str) -> str:
-    result = ocr.ocr(image_path)
-    texts = []
-
-    for block in result:
-        for line in block:
-            texts.append(line[1][0])
-
-    return " ".join(texts)
-
-
-# ===================== REGEX EXTRACTION =====================
-def regex_extract(text: str) -> dict:
-    phone = re.findall(r'\+?\d[\d\s\-]{8,}', text)
-    email = re.findall(r'[\w\.-]+@[\w\.-]+', text)
-    website = re.findall(r'(https?://\S+|www\.\S+)', text)
-
-    return {
-        "Phone": phone[0] if phone else "Not Found",
-        "Email": email[0] if email else "Not Found",
-        "Website": website[0] if website else "Not Found"
+def clean_text(text):
+    replacements = {
+        "(at)": "@",
+        "[at]": "@",
+        "O": "0",
+        "o": "0",
+        "l": "1",
+        "I": "1",
+        "|": "1",
+        "S": "5",
+        "s": "5"
     }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
+def extract_phone(text):
+    match = re.search(r'(\+?\d{1,3}[\s\-]?)?\d{9,10}', text)
+    return match.group() if match else "Not Found"
+
+def extract_email(text):
+    match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    return match.group() if match else "Not Found"
+
+def extract_website(text):
+    match = re.search(r'(www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|https?://[^\s]+)', text)
+    return match.group() if match else "Not Found"
+
+def save_to_excel(data, user_id, timestamp):
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb.active
+    ws.append([
+        data["name"],
+        data["designation"],
+        data["company"],
+        data["phone"],
+        data["email"],
+        data["website"],
+        data["address"],
+        data["industry"],
+        ", ".join(data["services"]),
+        timestamp,
+        user_id
+    ])
+    wb.save(EXCEL_FILE)
+
+def safe_json_load(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                return None
+        return None
 
 
-# ===================== AI EXTRACTION (GROQ) =====================
-def ai_extract(text: str) -> dict:
+def call_groq(prompt, temperature=0):
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("❌ Groq error:", e)
+        return None
+
+
+# ---------- /start ----------
+async def start(update: Update, context):
+    await update.message.reply_text(
+        "✅ Bot is running!\n\n"
+        "📸 Send a visiting card image\n"
+        "📊 Data saved to Excel\n"
+        "💬 Ask follow-up questions"
+    )
+
+# ---------- IMAGE HANDLER ----------
+async def handle_image(update: Update, context):
+    status_msg = await update.message.reply_text(
+        "📸 Image received & analyzing…"
+    )
+    scan_time = datetime.now()
+    formatted_time = scan_time.strftime("%d %b %Y | %I:%M %p")
+
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    await file.download_to_drive("card.jpg")
+
+    # ---------- IMAGE PREPROCESSING ----------
+    img = cv2.imread("card.jpg")
+    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    thresh = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )[1]
+
+    ocr_text = pytesseract.image_to_string(
+        thresh,
+        config="--oem 3 --psm 6"
+    )
+
+    cleaned_text = clean_text(ocr_text)
+
+    # ---------- REGEX EXTRACTION ----------
+    phone = extract_phone(cleaned_text)
+    email = extract_email(cleaned_text)
+    website = extract_website(cleaned_text)
+
+    # ---------- AI PROMPT ----------
     prompt = f"""
-You are extracting information from a visiting card OCR text.
+You are a data extraction engine.
 
-Rules:
-- Use reasoning to infer fields even if labels are missing.
-- Names are usually short, capitalized, near top.
-- Company names are often bold, larger, or repeated.
-- Address may span multiple lines.
-- If multiple guesses exist, choose the most likely one.
-- If absolutely impossible, return "Not Found".
+RULES:
+- Output ONLY valid JSON
+- No text, no markdown
+- Empty string if missing
 
-Return ONLY valid JSON with exactly these keys:
-Name, Designation, Company, Address, Industry, Services
+JSON FORMAT:
+{{
+  "name": "",
+  "designation": "",
+  "company": "",
+  "address": "",
+  "industry": "",
+  "services": []
+}}
 
-OCR TEXT:
-{text}
+TEXT:
+{ocr_text}
 """
 
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama3-70b-8192",
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": "You are an expert at reading business cards."},
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            timeout=20
+    ai_text = call_groq(prompt)
+
+    if not ai_text:
+        await update.message.reply_text(
+            "⚠️ AI service unavailable. Try again."
         )
+        return
 
-        return json.loads(r.json()["choices"][0]["message"]["content"])
+    raw = safe_json_load(ai_text)
 
-    except Exception:
-        return {
-            "Name": "Not Found",
-            "Designation": "Not Found",
-            "Company": "Not Found",
-            "Address": "Not Found",
-            "Industry": "Not Found",
-            "Services": "Not Found"
-        }
+    if not raw:
+        await update.message.reply_text(
+            "⚠️ Could not extract structured data.\n"
+            "Please try a clearer image."
+        )
+        return
 
+    data = {
+        "name": safe(raw.get("name")),
+        "designation": safe(raw.get("designation")),
+        "company": safe(raw.get("company")),
+        "phone": safe(phone),
+        "email": safe(email),
+        "website": safe(website),
+        "address": safe(raw.get("address")),
+        "industry": safe(raw.get("industry")),
+        "services": raw.get("services") if raw.get("services") else ["Not Found"]
+    }
 
-# ===================== USER CONTEXT =====================
-user_context = {}
+    context.user_data["company"] = data["company"]
+    context.user_data["website"] = data["website"]
 
-
-# ===================== SAVE TO GOOGLE SHEET =====================
-def save_to_sheet(chat_id: int, data: dict):
+    # ===================== SAVE TO SHEET =====================
+    def save_to_sheet(chat_id, data):
     ist = pytz.timezone("Asia/Kolkata")
     timestamp = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -167,109 +251,57 @@ def save_to_sheet(chat_id: int, data: dict):
         data["Services"]
     ])
 
+    reply = f"""
+📇 Visiting Card Details
 
-# ===================== FOLLOW-UP Q&A =====================
-def answer_followup(company_data: dict, question: str) -> str:
-    context = f"""
-Company: {company_data['Company']}
-Industry: {company_data['Industry']}
-Services: {company_data['Services']}
+Name: {data['name']}
+Designation: {data['designation']}
+Company: {data['company']}
+Phone: {data['phone']}
+Email: {data['email']}
+Website: {data['website']}
+Address: {data['address']}
+Industry: {data['industry']}
+Services:
+- {'\n- '.join(data['services'])}
+
+🕒 Scanned On: {formatted_time}
 """
 
-    prompt = f"""
-You are a business analyst.
-Answer using public knowledge and reasoning.
-If exact data is unavailable, provide realistic estimates
-and clearly state assumptions.
+    await update.message.reply_text(reply)
 
-Context:
-{context}
+# ---------- FOLLOW-UP ----------
+async def handle_text(update: Update, context):
+    company = context.user_data.get("company")
 
-Question:
-{question}
-"""
-
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama3-70b-8192",
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=15
-        )
-
-        return r.json()["choices"][0]["message"]["content"]
-
-    except Exception:
-        return "Unable to fetch information right now."
-
-
-# ===================== TELEGRAM HANDLERS =====================
-async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Image received & analyzing...")
-
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    path = f"/tmp/{photo.file_id}.jpg"
-    await file.download_to_drive(path)
-
-    text = run_ocr(path)
-
-    print("OCR RAW TEXT >>>>>>>>>>>>>>>>>>")
-    print(text)
-    print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
-
-    regex_data = regex_extract(text)
-    ai_data = ai_extract(text)
-
-    final_data = {
-        "Name": ai_data.get("Name", "Not Found"),
-        "Designation": ai_data.get("Designation", "Not Found"),
-        "Company": ai_data.get("Company", "Not Found"),
-        "Phone": regex_data["Phone"],
-        "Email": regex_data["Email"],
-        "Website": regex_data["Website"],
-        "Address": ai_data.get("Address", "Not Found"),
-        "Industry": ai_data.get("Industry", "Not Found"),
-        "Services": ai_data.get("Services", "Not Found")
-    }
-
-    user_context[update.effective_chat.id] = final_data
-    save_to_sheet(update.effective_chat.id, final_data)
-
-    reply = "\n".join([f"*{k}*: {v}" for k, v in final_data.items()])
-    await update.message.reply_markdown(reply)
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if chat_id not in user_context:
-        await update.message.reply_text("Please send a visiting card image first.")
+    if not company or company == "Not Found":
+        await update.message.reply_text("📸 Please upload a visiting card first.")
         return
 
-    answer = answer_followup(user_context[chat_id], update.message.text)
-    await update.message.reply_text(answer)
+    prompt = f"""
+    Company: {company}
+    Website: {context.user_data.get("website")}
 
+    Explain:
+    • What the company does
+    • Potential customers
+    • Potential vendors
+    Focus on India.
+    """
 
-# ===================== MAIN =====================
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    response = client.chat.completions.create(
+        model= MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
 
-    app.add_handler(MessageHandler(filters.PHOTO, image_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    await update.message.reply_text(response.choices[0].message.content)
 
-    print("Bot running 24×7")
-    app.run_polling()
+# ---------- RUN ----------
+app = Application.builder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-
-if __name__ == "__main__":
-    main()
-
-
-
+print("🚀 Bot is LIVE and listening...")
+app.run_polling()
