@@ -1,27 +1,31 @@
-# ---------- Base Image ----------
+# ================= BASE IMAGE =================
 FROM python:3.11-slim
 
-# ---------- Environment ----------
+# ================= ENV SETTINGS =================
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# ---------- System Dependencies ----------
+# ================= SYSTEM DEPENDENCIES =================
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-hin \
+    tesseract-ocr-mar \
+    tesseract-ocr-osd \
     libtesseract-dev \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------- Working Directory ----------
+# ================= WORKDIR =================
 WORKDIR /app
 
-# ---------- Python Dependencies ----------
+# ================= PYTHON DEPENDENCIES =================
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---------- Application Code ----------
+# ================= APP CODE =================
 COPY . .
 
-# ---------- Start Bot ----------
+# ================= START BOT =================
 CMD ["python", "main1.py"]
